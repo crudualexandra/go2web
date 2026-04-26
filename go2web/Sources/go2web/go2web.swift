@@ -5,6 +5,10 @@ import Darwin
 import Glibc
 #endif
 
+#if canImport(Network)
+@preconcurrency import Network
+#endif
+
 @discardableResult
 func printHelp(to handle: FileHandle = .standardOutput) -> Int32 {
     let help = """
@@ -432,6 +436,299 @@ private func isIPv6LiteralHost(_ host: String) -> Bool {
     return host.contains(":")
 }
 
+#if canImport(Network)
+@available(macOS 10.14, *)
+final class HTTPSClientBox: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var responseData = Data()
+    private var connection: NWConnection?
+
+    func append(_ data: Data) {
+        lock.lock()
+        responseData.append(data)
+        lock.unlock()
+    }
+
+    func finish() {
+        semaphore.signal()
+    }
+
+    func wait() {
+        _ = semaphore.wait(timeout: .now() + 30)
+    }
+
+    func resultString() -> String? {
+        lock.lock()
+        let data = responseData
+        lock.unlock()
+        return String(data: data, encoding: .utf8)
+    }
+
+    func start(host: String, port: UInt16, request: String, tls: Bool) {
+        let params = tls ? NWParameters.tls : NWParameters.tcp
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            finish()
+            return
+        }
+
+        let conn = NWConnection(
+            host: NWEndpoint.Host(host),
+            port: nwPort,
+            using: params
+        )
+
+        self.connection = conn
+
+        conn.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+
+            switch state {
+            case .ready:
+                let requestData = Data(request.utf8)
+                conn.send(content: requestData, completion: .contentProcessed { [weak self] _ in
+                    self?.receiveNext()
+                })
+
+            case .failed(_), .cancelled:
+                self.finish()
+
+            default:
+                break
+            }
+        }
+
+        conn.start(queue: DispatchQueue.global())
+    }
+
+    private func receiveNext() {
+        guard let conn = connection else {
+            finish()
+            return
+        }
+
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+
+            if let data, !data.isEmpty {
+                self.append(data)
+            }
+
+            if isComplete || error != nil {
+                self.finish()
+            } else {
+                self.receiveNext()
+            }
+        }
+    }
+
+    func cancel() {
+        connection?.cancel()
+    }
+}
+
+@available(macOS 10.14, *)
+private func receiveAllOverNWConnection(host: String, port: UInt16, request: String, tls: Bool) -> String? {
+    let box = HTTPSClientBox()
+    box.start(host: host, port: port, request: request, tls: tls)
+    box.wait()
+    box.cancel()
+    return box.resultString()
+}
+
+
+func performHTTPSGet(host: String, port: Int, path: String) -> HTTPFetchResult? {
+    var current = ParsedURL(scheme: "https", host: host, port: port, path: path)
+    let maxRedirects = 5
+    var redirects = 0
+
+    while true {
+        let hostHeaderHost = isIPv6LiteralHost(current.host) ? "[\(current.host)]" : current.host
+        let request = buildHTTPRequest(hostHeader: hostHeaderHost, path: current.path, defaultPort: 443, port: current.port)
+        guard let response = receiveAllOverNWConnection(host: current.host, port: UInt16(current.port), request: request, tls: true) else {
+            _ = printError("HTTPS connection failed.")
+            return nil
+        }
+
+        func handleHeadAndBody(head: String, body: String) -> HTTPFetchResult? {
+            let lines = head.split(whereSeparator: { $0.isNewline }).map(String.init)
+            let statusLine = lines.first ?? ""
+            var statusCode = 0
+            let parts = statusLine.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+            if parts.count >= 2, let code = Int(parts[1]) { statusCode = code }
+
+            var contentTypeHeader: String? = nil
+            var transferEncodingHeader: String? = nil
+            var locationHeader: String? = nil
+
+            for headerLine in lines.dropFirst() {
+                if let colon = headerLine.firstIndex(of: ":") {
+                    let name = headerLine[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+                    let value = headerLine[headerLine.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+                    switch name {
+                    case "content-type": contentTypeHeader = String(value)
+                    case "transfer-encoding": transferEncodingHeader = String(value)
+                    case "location": locationHeader = String(value)
+                    default: break
+                    }
+                }
+            }
+
+            if [301, 302, 303, 307, 308].contains(statusCode), let loc = locationHeader {
+                let lower = loc.lowercased()
+                if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
+                    if let parsed = try? parseURL(loc) {
+                        if parsed.scheme == "https" {
+                            current = parsed
+                        } else {
+                            // Switch to plain HTTP client for http redirects
+                            return performPlainHTTPGet(host: parsed.host, port: parsed.port, path: parsed.path)
+                        }
+                    } else {
+                        _ = printError("Invalid redirect Location: \(loc)")
+                        return nil
+                    }
+                } else {
+                    let newPath = resolveRelativePath(basePath: current.path, relative: loc)
+                    current = ParsedURL(scheme: current.scheme, host: current.host, port: current.port, path: newPath)
+                }
+                redirects += 1
+                if redirects > maxRedirects {
+                    _ = printError("Too many redirects (max 5).")
+                    return nil
+                }
+                return nil
+            }
+
+            var processedBody = body
+            if let te = transferEncodingHeader?.lowercased(), te.contains("chunked") {
+                processedBody = decodeChunkedBody(body)
+            }
+            let readable = makeHumanReadable(body: processedBody, contentType: contentTypeHeader)
+            return HTTPFetchResult(statusCode: statusCode, contentType: contentTypeHeader, readableBody: readable)
+        }
+
+        if let sep = response.range(of: "\r\n\r\n") {
+            let head = String(response[..<sep.lowerBound])
+            let body = String(response[sep.upperBound...])
+            if let r = handleHeadAndBody(head: head, body: body) { return r } else { continue }
+        } else if let sep = response.range(of: "\n\n") {
+            let head = String(response[..<sep.lowerBound])
+            let body = String(response[sep.upperBound...])
+            if let r = handleHeadAndBody(head: head, body: body) { return r } else { continue }
+        } else {
+            return HTTPFetchResult(statusCode: 0, contentType: nil, readableBody: response)
+        }
+    }
+}
+
+// Raw-HTML variant for search parsing
+func performHTTPSGetRawHTML(host: String, port: Int, path: String) -> (Int, String?, String)? {
+    var current = ParsedURL(scheme: "https", host: host, port: port, path: path)
+    let maxRedirects = 5
+    var redirects = 0
+
+    while true {
+        let hostHeaderHost = isIPv6LiteralHost(current.host) ? "[\(current.host)]" : current.host
+        let request = buildHTTPRequest(hostHeader: hostHeaderHost, path: current.path, defaultPort: 443, port: current.port)
+        guard let response = receiveAllOverNWConnection(host: current.host, port: UInt16(current.port), request: request, tls: true) else {
+            return nil
+        }
+
+        func handleHeadAndBody(head: String, body: String) -> (Int, String?, String)? {
+            let lines = head.split(whereSeparator: { $0.isNewline }).map(String.init)
+            let statusLine = lines.first ?? ""
+            var statusCode = 0
+            let parts = statusLine.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+            if parts.count >= 2, let code = Int(parts[1]) { statusCode = code }
+
+            var contentTypeHeader: String? = nil
+            var transferEncodingHeader: String? = nil
+            var locationHeader: String? = nil
+
+            for headerLine in lines.dropFirst() {
+                if let colon = headerLine.firstIndex(of: ":") {
+                    let name = headerLine[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+                    let value = headerLine[headerLine.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+                    switch name {
+                    case "content-type": contentTypeHeader = String(value)
+                    case "transfer-encoding": transferEncodingHeader = String(value)
+                    case "location": locationHeader = String(value)
+                    default: break
+                    }
+                }
+            }
+
+            if [301, 302, 303, 307, 308].contains(statusCode), let loc = locationHeader {
+                let lower = loc.lowercased()
+                if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
+                    if let parsed = try? parseURL(loc) {
+                        if parsed.scheme == "https" {
+                            // Switch to plain HTTP client for http redirects (raw body not supported here)
+                            if let result = performPlainHTTPGet(host: parsed.host, port: parsed.port, path: parsed.path) {
+                                return (result.statusCode, result.contentType, result.readableBody)
+                            }
+                            return nil
+                        } else {
+                            current = parsed
+                        }
+                    } else {
+                        return nil
+                    }
+                } else {
+                    let newPath = resolveRelativePath(basePath: current.path, relative: loc)
+                    current = ParsedURL(scheme: current.scheme, host: current.host, port: current.port, path: newPath)
+                }
+                redirects += 1
+                if redirects > maxRedirects { return nil }
+                return nil
+            }
+
+            var processedBody = body
+            if let te = transferEncodingHeader?.lowercased(), te.contains("chunked") {
+                processedBody = decodeChunkedBody(body)
+            }
+            return (statusCode, contentTypeHeader, processedBody)
+        }
+
+        if let sep = response.range(of: "\r\n\r\n") {
+            let head = String(response[..<sep.lowerBound])
+            let body = String(response[sep.upperBound...])
+            if let r = handleHeadAndBody(head: head, body: body) { return r } else { continue }
+        } else if let sep = response.range(of: "\n\n") {
+            let head = String(response[..<sep.lowerBound])
+            let body = String(response[sep.upperBound...])
+            if let r = handleHeadAndBody(head: head, body: body) { return r } else { continue }
+        } else {
+            return (0, nil, response)
+        }
+    }
+}
+
+private func buildHTTPRequest(hostHeader: String, path: String, defaultPort: Int, port: Int) -> String {
+    let headerHost = port == defaultPort ? hostHeader : "\(hostHeader):\(port)"
+    return """
+    GET \(path.isEmpty ? "/" : path) HTTP/1.1\r
+    Host: \(headerHost)\r
+    User-Agent: go2web-swift/1.0\r
+    Accept: text/html, application/json\r
+    Connection: close\r
+    \r
+    \n
+    """
+}
+#else
+func performHTTPSGet(host: String, port: Int, path: String) -> HTTPFetchResult? {
+    print("HTTPS is not supported on this platform (Network.framework unavailable).")
+    return nil
+}
+
+func performHTTPSGetRawHTML(host: String, port: Int, path: String) -> (Int, String?, String)? {
+    print("HTTPS is not supported on this platform (Network.framework unavailable).")
+    return nil
+}
+#endif
+
 private func cacheDirectoryURL() -> URL {
     return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         .appendingPathComponent(".go2web-cache", isDirectory: true)
@@ -766,7 +1063,7 @@ func run() -> Int32 {
         return printHelp()
     }
 
-    let index = 1
+    var index = 1
 
     while index < args.count {
         let arg = args[index]
@@ -787,25 +1084,25 @@ func run() -> Int32 {
             do {
                 let parsed = try parseURL(urlString)
 
-                if parsed.scheme == "https" {
-                    print("HTTPS support will be added later.")
-                    return 0
-                }
-
                 if let cached = readCache(for: urlString) {
                     print("[CACHE HIT]")
                     print(cached.readableBody)
                     return 0
                 }
 
-                guard let result = performPlainHTTPGet(host: parsed.host, port: parsed.port, path: parsed.path) else {
-                    return 1
+                let result: HTTPFetchResult?
+                if parsed.scheme == "https" {
+                    result = performHTTPSGet(host: parsed.host, port: parsed.port, path: parsed.path)
+                } else {
+                    result = performPlainHTTPGet(host: parsed.host, port: parsed.port, path: parsed.path)
                 }
 
-                print(result.readableBody)
+                guard let final = result else { return 1 }
 
-                if result.statusCode >= 200 && result.statusCode < 300 {
-                    saveCache(for: urlString, result: result)
+                print(final.readableBody)
+
+                if final.statusCode >= 200 && final.statusCode < 300 {
+                    saveCache(for: urlString, result: final)
                 }
 
                 return 0
@@ -823,21 +1120,47 @@ func run() -> Int32 {
                 return printError("Missing search term after -s.\n\nTry: go2web -s swift concurrency tutorial")
             }
             let terms = args[nextIndex...].joined(separator: " ")
-            // Encode spaces as + per requirement
             let query = terms.replacingOccurrences(of: " ", with: "+")
             let searchURL = "https://html.duckduckgo.com/html/?q=\(query)"
 
-            print("[SEARCH] DuckDuckGo HTML: \(searchURL)")
-            print("HTTPS is required for this endpoint. Add HTTPS client support to fetch and parse results. The parser is ready.")
-            // Once HTTPS is implemented, you can:
-            // 1) fetch the body from searchURL
-            // 2) let results = parseDuckDuckGoHTML(body)
-            // 3) pretty-print results
-            return 0
+            do {
+                let parsed = try parseURL(searchURL)
+                if parsed.scheme == "https" {
+                    if let (status, contentType, rawHTML) = performHTTPSGetRawHTML(host: parsed.host, port: parsed.port, path: parsed.path) {
+                        if status >= 200 && status < 300 {
+                            let results = parseDuckDuckGoHTML(rawHTML)
+                            if results.isEmpty {
+                                print("No results parsed.")
+                            } else {
+                                for (idx, r) in results.enumerated() {
+                                    print("\(idx + 1). \(r.title)")
+                                    print(r.link)
+                                    if let s = r.snippet, !s.isEmpty { print(s) }
+                                    print("")
+                                }
+                            }
+                            return 0
+                        } else {
+                            print("Search request failed with status: \(status). Content-Type: \(contentType ?? "-")")
+                            return 1
+                        }
+                    } else {
+                        print("Failed to perform HTTPS search request.")
+                        return 1
+                    }
+                } else {
+                    print("DuckDuckGo HTML search requires HTTPS.")
+                    return 1
+                }
+            } catch {
+                return printError("Failed to build search URL.")
+            }
 
         default:
             return printError("Unknown option or argument: \(arg).\n\nRun 'go2web -h' for usage.")
         }
+
+        index += 1
     }
 
     return 0

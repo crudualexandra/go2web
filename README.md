@@ -184,3 +184,24 @@ The program now:
 - does not use external HTML parser libraries;
 - does not use `URLSession`, `URLRequest`, `Data(contentsOf:)`, or HTTP client libraries.
 At this stage, real search fetching is not active yet because the selected DuckDuckGo HTML endpoint requires HTTPS. The search parser is already implemented and will be used after HTTPS transport support is added.
+
+
+### Step 8 — HTTPS transport support
+
+In this step, HTTPS support was added using Apple `Network.framework`.
+
+The program still does not use `URLSession`, `URLRequest`, `Data(contentsOf:)`, or any HTTP client library. The HTTP request is still manually constructed as a raw HTTP/1.1 text request. `Network.framework` is used only as the TLS transport layer for HTTPS connections.
+
+
+### Step 9 — Search top 10 results
+
+In this step, the -s command was completed.
+
+The program now:
+    •    builds the DuckDuckGo HTML search URL;
+    •    sends the request over HTTPS;
+    •    receives the HTML response;
+    •    parses the result titles and links manually;
+    •    prints the top 10 search results;
+    •    does not use URLSession, URLRequest, Data(contentsOf:), or HTTP client libraries.
+This satisfies the main laboratory requirement for go2web -s <search-term>.
