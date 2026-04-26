@@ -186,69 +186,278 @@ private func decodeCommonHTMLEntities(_ text: String) -> String {
 }
 
 func parseDuckDuckGoHTML(_ html: String) -> [SearchResult] {
-    // Normalize newlines and collapse some whitespace for simpler regex scanning
+    // Normalize newlines
     let text = html.replacingOccurrences(of: "\r\n", with: "\n")
                    .replacingOccurrences(of: "\r", with: "\n")
 
-    // Regex to find result titles and links
-    // Captures href (group 1) and inner HTML of the anchor (group 2)
-    let pattern = "<a[^>]*class=\\\"result__a\\\"[^>]*href=\\\"([^\\\"]+)\\\"[^>]*>([\\s\\S]*?)</a>"
-    guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+    // Broad anchor regex to capture attributes and inner HTML
+    let anchorPattern = #"<a\b([^>]*)>([\s\S]*?)</a>"#
+    guard let anchorRe = try? NSRegularExpression(pattern: anchorPattern, options: [.caseInsensitive]) else { return [] }
+
+    // Regexes to extract attributes and inspect content
+    let hrefRe = try? NSRegularExpression(pattern: #"href\s*=\s*["']([^"']+)["']"#, options: [.caseInsensitive])
+    let classRe = try? NSRegularExpression(pattern: #"class\s*=\s*["']([^"']+)["']"#, options: [.caseInsensitive])
+
+    func containsResultClass(_ classAttr: String) -> Bool {
+        classAttr.lowercased().contains("result__a")
+    }
+
+    // Helper to strip tags and clean text
+    func stripTagsAndClean(_ s: String) -> String {
+        var t = s
+        if let tagRe = try? NSRegularExpression(pattern: "<[^>]+>", options: []) {
+            let r = NSRange(t.startIndex..<t.endIndex, in: t)
+            t = tagRe.stringByReplacingMatches(in: t, options: [], range: r, withTemplate: " ")
+        }
+        t = decodeCommonHTMLEntities(t)
+        if let spaceRe = try? NSRegularExpression(pattern: "[ \\t]+", options: []) {
+            let r = NSRange(t.startIndex..<t.endIndex, in: t)
+            t = spaceRe.stringByReplacingMatches(in: t, options: [], range: r, withTemplate: " ")
+        }
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // Helper to normalize links according to rules
+    func normalizeLink(_ raw: String) -> String? {
+        var link = raw.replacingOccurrences(of: "&amp;", with: "&")
+        // protocol-relative
+        if link.hasPrefix("//") { link = "https:" + link }
+        // if DDG redirect with uddg, decode target
+        if let range = link.range(of: "uddg=") {
+            let after = link[range.upperBound...]
+            let value = after.split(separator: "&", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? String(after)
+            let decoded = percentDecode(value)
+            link = decoded
+        } else if link.hasPrefix("/l/?") || link.hasPrefix("/l?") {
+            // DDG redirect without uddg: prefix site
+            link = "https://duckduckgo.com" + link
+        }
+        let lower = link.lowercased()
+        guard lower.hasPrefix("http://") || lower.hasPrefix("https://") else { return nil }
+        return link
+    }
 
     var results: [SearchResult] = []
-    let nsrange = NSRange(text.startIndex..<text.endIndex, in: text)
+    var seen: Set<String> = []
 
-    re.enumerateMatches(in: text, options: [], range: nsrange) { match, _, stop in
+    let nsrange = NSRange(text.startIndex..<text.endIndex, in: text)
+    anchorRe.enumerateMatches(in: text, options: [], range: nsrange) { match, _, stop in
         guard let match = match, match.numberOfRanges >= 3 else { return }
+        guard let attrsRange = Range(match.range(at: 1), in: text),
+              let bodyRange = Range(match.range(at: 2), in: text) else { return }
+
+        let attrs = String(text[attrsRange])
+        let bodyHTML = String(text[bodyRange])
 
         // Extract href
-        let hrefRange = match.range(at: 1)
-        let titleHTMLRange = match.range(at: 2)
-        guard let hrefSwiftRange = Range(hrefRange, in: text),
-              let titleHTMLSwiftRange = Range(titleHTMLRange, in: text) else { return }
-
-        let href = String(text[hrefSwiftRange])
-        var titleHTML = String(text[titleHTMLSwiftRange])
-
-        // Convert basic entities and strip inner tags to get title text
-        titleHTML = decodeCommonHTMLEntities(titleHTML)
-        if let titleTags = try? NSRegularExpression(pattern: "<[^>]+>", options: []) {
-            let r = NSRange(titleHTML.startIndex..<titleHTML.endIndex, in: titleHTML)
-            titleHTML = titleTags.stringByReplacingMatches(in: titleHTML, options: [], range: r, withTemplate: " ")
+        var href: String? = nil
+        if let hrefRe = hrefRe {
+            let ns = NSRange(attrs.startIndex..<attrs.endIndex, in: attrs)
+            if let m = hrefRe.firstMatch(in: attrs, options: [], range: ns), m.numberOfRanges >= 2,
+               let r = Range(m.range(at: 1), in: attrs) {
+                href = String(attrs[r])
+            }
         }
-        let title = titleHTML.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let rawHref = href else { return }
 
-        // DuckDuckGo uses redirect links like /l/?kh=-1&uddg=<encoded>
-        // Try to resolve uddg parameter if present
-        var link = href.replacingOccurrences(of: "&amp;", with: "&")
-        if link.hasPrefix("/l/?") || link.hasPrefix("/l? ") || link.contains("uddg=") {
-            if let qIndex = link.range(of: "uddg=")?.upperBound {
-                let encoded = String(link[qIndex...])
-                // Trim after next & if present
-                let decodedParam = encoded.split(separator: "&", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? encoded
-                link = percentDecode(decodedParam)
+        // Extract class
+        var classAttr: String = ""
+        if let classRe = classRe {
+            let ns = NSRange(attrs.startIndex..<attrs.endIndex, in: attrs)
+            if let m = classRe.firstMatch(in: attrs, options: [], range: ns), m.numberOfRanges >= 2,
+               let r = Range(m.range(at: 1), in: attrs) {
+                classAttr = String(attrs[r])
             }
         }
 
-        // Find a nearby snippet after this anchor
-        var snippet: String? = nil
-        let searchStart = titleHTMLSwiftRange.upperBound
-        let tail = String(text[searchStart...])
-        if let snippetRe = try? NSRegularExpression(pattern: "<div[^>]*class=\\\"result__snippet[^\\\"]*\\\"[^>]*>([\\s\\S]*?)</div>", options: [.caseInsensitive]) {
-            let nsTail = NSRange(tail.startIndex..<tail.endIndex, in: tail)
-            if let m = snippetRe.firstMatch(in: tail, options: [], range: nsTail), m.numberOfRanges >= 2,
-               let sr = Range(m.range(at: 1), in: tail) {
-                var inner = String(tail[sr])
-                inner = decodeCommonHTMLEntities(inner)
-                if let tagRe = try? NSRegularExpression(pattern: "<[^>]+>", options: []) {
-                    let r = NSRange(inner.startIndex..<inner.endIndex, in: inner)
-                    inner = tagRe.stringByReplacingMatches(in: inner, options: [], range: r, withTemplate: " ")
+        // Determine if this anchor should be considered a result
+        let lowerHref = rawHref.lowercased()
+        let isResult = containsResultClass(classAttr) || lowerHref.contains("uddg=") || lowerHref.hasPrefix("/l/?") || lowerHref.hasPrefix("/l?")
+        if !isResult { return }
+
+        // Clean title
+        let title = stripTagsAndClean(bodyHTML)
+        if title.isEmpty { return }
+
+        // Normalize link
+        guard let link = normalizeLink(rawHref) else { return }
+        if seen.contains(link) { return }
+
+        results.append(SearchResult(title: title, link: link, snippet: nil))
+        seen.insert(link)
+        if results.count >= 10 { stop.pointee = true }
+    }
+
+    if !results.isEmpty {
+        return results
+    }
+
+    // Fallback extraction: scan all hrefs and build reasonable results
+    guard let hrefScanRe = try? NSRegularExpression(pattern: #"href\s*=\s*[\"']([^\"']+)[\"']"#, options: [.caseInsensitive]) else {
+        return results
+    }
+
+    // Map of link -> title if found from an anchor
+    var linkToTitle: [String: String] = [:]
+
+    // First, try to pair hrefs with nearby anchor text using the broad anchor regex
+    do {
+        let anchorPattern = #"<a\b([^>]*)>([\s\S]*?)</a>"#
+        let anchorRe = try NSRegularExpression(pattern: anchorPattern, options: [.caseInsensitive])
+        let nsrange = NSRange(text.startIndex..<text.endIndex, in: text)
+        anchorRe.enumerateMatches(in: text, options: [], range: nsrange) { match, _, _ in
+            guard let match = match, match.numberOfRanges >= 3,
+                  let attrsRange = Range(match.range(at: 1), in: text),
+                  let bodyRange = Range(match.range(at: 2), in: text) else { return }
+            let attrs = String(text[attrsRange])
+            let bodyHTML = String(text[bodyRange])
+
+            if let m = hrefScanRe.firstMatch(in: attrs, options: [], range: NSRange(attrs.startIndex..<attrs.endIndex, in: attrs)),
+               m.numberOfRanges >= 2,
+               let r = Range(m.range(at: 1), in: attrs) {
+                let rawHref = String(attrs[r])
+                var link = rawHref.replacingOccurrences(of: "&amp;", with: "&")
+                if let range = link.range(of: "uddg=") {
+                    let after = link[range.upperBound...]
+                    let value = after.split(separator: "&", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? String(after)
+                    link = percentDecode(value)
+                } else if link.hasPrefix("//") {
+                    link = "https:" + link
                 }
-                snippet = inner.trimmingCharacters(in: .whitespacesAndNewlines)
+                let lower = link.lowercased()
+                if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
+                    let cleanedTitle = stripTagsAndClean(bodyHTML)
+                    if !cleanedTitle.isEmpty {
+                        linkToTitle[link] = cleanedTitle
+                    }
+                }
+            }
+        }
+    } catch {
+        // ignore
+    }
+
+    // Now scan all hrefs and build results
+    let scanRange = NSRange(text.startIndex..<text.endIndex, in: text)
+    hrefScanRe.enumerateMatches(in: text, options: [], range: scanRange) { match, _, stop in
+        guard let match = match, match.numberOfRanges >= 2,
+              let r = Range(match.range(at: 1), in: text) else { return }
+        var link = String(text[r]).replacingOccurrences(of: "&amp;", with: "&")
+
+        // uddg decoding
+        if let range = link.range(of: "uddg=") {
+            let after = link[range.upperBound...]
+            let value = after.split(separator: "&", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? String(after)
+            link = percentDecode(value)
+        } else if link.hasPrefix("//") {
+            link = "https:" + link
+        }
+
+        let lower = link.lowercased()
+        // Ignore unwanted links
+        if lower.contains("duckduckgo.com") || lower.hasPrefix("javascript:") || lower.hasPrefix("#") || lower.contains("/settings") || lower.contains("/feedback") || lower.contains("/html/") {
+            return
+        }
+
+        // Keep only absolute http(s)
+        guard lower.hasPrefix("http://") || lower.hasPrefix("https://") else { return }
+
+        if seen.contains(link) { return }
+
+        // Title preference: from anchor mapping if available; otherwise hostname or URL
+        var title = linkToTitle[link] ?? ""
+        if title.isEmpty {
+            if let hostStart = link.range(of: "://")?.upperBound {
+                let after = link[hostStart...]
+                let host = after.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? String(after)
+                title = host
+            } else {
+                title = link
+            }
+        }
+        title = stripTagsAndClean(title)
+        if title.isEmpty { title = link }
+
+        results.append(SearchResult(title: title, link: link, snippet: nil))
+        seen.insert(link)
+        if results.count >= 10 { stop.pointee = true }
+    }
+
+    return results
+}
+
+func parseBingHTML(_ html: String) -> [SearchResult] {
+    // Normalize newlines
+    let text = html.replacingOccurrences(of: "\r\n", with: "\n")
+                   .replacingOccurrences(of: "\r", with: "\n")
+
+    // Helper to strip tags and clean
+    func clean(_ s: String) -> String {
+        var t = s
+        if let tagRe = try? NSRegularExpression(pattern: "<[^>]+>", options: []) {
+            let r = NSRange(t.startIndex..<t.endIndex, in: t)
+            t = tagRe.stringByReplacingMatches(in: t, options: [], range: r, withTemplate: " ")
+        }
+        t = decodeCommonHTMLEntities(t)
+        if let spaceRe = try? NSRegularExpression(pattern: "[ \t]+", options: []) {
+            let r = NSRange(t.startIndex..<t.endIndex, in: t)
+            t = spaceRe.stringByReplacingMatches(in: t, options: [], range: r, withTemplate: " ")
+        }
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // Match Bing result blocks
+    guard let liRe = try? NSRegularExpression(pattern: #"<li\b[^>]*class=\"[^\"]*b_algo[^\"]*\"[^>]*>([\s\S]*?)</li>"#, options: [.caseInsensitive]) else {
+        return []
+    }
+
+    // Match title and link inside h2 > a
+    let titleLinkRe = try? NSRegularExpression(pattern: #"<h2[^>]*>\s*<a\b[^>]*href=\"([^\"]+)\"[^>]*>([\s\S]*?)</a>\s*</h2>"#, options: [.caseInsensitive])
+    // Match snippet paragraph
+    let snippetRe = try? NSRegularExpression(pattern: #"<p[^>]*>([\s\S]*?)</p>"#, options: [.caseInsensitive])
+
+    var results: [SearchResult] = []
+    var seen: Set<String> = []
+
+    let nsText = NSRange(text.startIndex..<text.endIndex, in: text)
+    liRe.enumerateMatches(in: text, options: [], range: nsText) { li, _, stop in
+        guard let li = li, li.numberOfRanges >= 2, let liRange = Range(li.range(at: 1), in: text) else { return }
+        let block = String(text[liRange])
+
+        var link: String? = nil
+        var titleHTML: String? = nil
+
+        if let titleLinkRe = titleLinkRe {
+            let ns = NSRange(block.startIndex..<block.endIndex, in: block)
+            if let m = titleLinkRe.firstMatch(in: block, options: [], range: ns), m.numberOfRanges >= 3,
+               let hrefR = Range(m.range(at: 1), in: block),
+               let titleR = Range(m.range(at: 2), in: block) {
+                link = String(block[hrefR])
+                titleHTML = String(block[titleR])
             }
         }
 
-        results.append(SearchResult(title: title, link: link, snippet: snippet))
+        guard var rawLink = link, let titleHTMLUnwrapped = titleHTML else { return }
+
+        rawLink = rawLink.replacingOccurrences(of: "&amp;", with: "&")
+        let lower = rawLink.lowercased()
+        guard lower.hasPrefix("http://") || lower.hasPrefix("https://") else { return }
+        if seen.contains(rawLink) { return }
+
+        let title = clean(titleHTMLUnwrapped)
+        var snippet: String? = nil
+        if let snippetRe = snippetRe {
+            let ns = NSRange(block.startIndex..<block.endIndex, in: block)
+            if let m = snippetRe.firstMatch(in: block, options: [], range: ns), m.numberOfRanges >= 2,
+               let sR = Range(m.range(at: 1), in: block) {
+                let rawSnippet = String(block[sR])
+                let cleaned = clean(rawSnippet)
+                if !cleaned.isEmpty { snippet = cleaned }
+            }
+        }
+
+        results.append(SearchResult(title: title, link: rawLink, snippet: snippet))
+        seen.insert(rawLink)
         if results.count >= 10 { stop.pointee = true }
     }
 
@@ -834,6 +1043,23 @@ private func saveCache(for url: String, result: HTTPFetchResult) {
     try? raw.write(to: fileURL, atomically: true, encoding: .utf8)
 }
 
+private func lastSearchFileURL() -> URL {
+    return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent(".go2web-last-search")
+}
+
+private func saveLastSearch(urls: [String]) {
+    let content = urls.joined(separator: "\n")
+    try? content.write(to: lastSearchFileURL(), atomically: true, encoding: .utf8)
+}
+
+private func loadLastSearch() -> [String]? {
+    guard let raw = try? String(contentsOf: lastSearchFileURL(), encoding: .utf8) else {
+        return nil
+    }
+    return raw.split(whereSeparator: { $0.isNewline }).map(String.init)
+}
+
 func performPlainHTTPGet(host: String, port: Int, path: String) -> HTTPFetchResult? {
     var current = ParsedURL(scheme: "http", host: host, port: port, path: path)
     let maxRedirects = 5
@@ -1081,10 +1307,20 @@ func run() -> Int32 {
 
             let urlString = args[nextIndex]
 
-            do {
-                let parsed = try parseURL(urlString)
+            var resolvedURLString = urlString
+            if let idx = Int(urlString), (1...10).contains(idx) {
+                if let urls = loadLastSearch(), idx <= urls.count {
+                    resolvedURLString = urls[idx - 1]
+                    print("[USING LAST SEARCH #\(idx) -> \(resolvedURLString)]")
+                } else {
+                    return printError("No last search results found or index out of range. Run 'go2web -s <term>' first.")
+                }
+            }
 
-                if let cached = readCache(for: urlString) {
+            do {
+                let parsed = try parseURL(resolvedURLString)
+
+                if let cached = readCache(for: resolvedURLString) {
                     print("[CACHE HIT]")
                     print(cached.readableBody)
                     return 0
@@ -1102,7 +1338,7 @@ func run() -> Int32 {
                 print(final.readableBody)
 
                 if final.statusCode >= 200 && final.statusCode < 300 {
-                    saveCache(for: urlString, result: final)
+                    saveCache(for: resolvedURLString, result: final)
                 }
 
                 return 0
@@ -1110,7 +1346,7 @@ func run() -> Int32 {
                 if let e = error as? URLParseError {
                     return printError(e.localizedDescription)
                 } else {
-                    return printError("Failed to parse URL: \(urlString)")
+                    return printError("Failed to parse URL: \(resolvedURLString)")
                 }
             }
 
@@ -1120,17 +1356,26 @@ func run() -> Int32 {
                 return printError("Missing search term after -s.\n\nTry: go2web -s swift concurrency tutorial")
             }
             let terms = args[nextIndex...].joined(separator: " ")
-            let query = terms.replacingOccurrences(of: " ", with: "+")
-            let searchURL = "https://html.duckduckgo.com/html/?q=\(query)"
+            let exactTerms = "\"\(terms)\""
+            let query = exactTerms
+                .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)?
+                .replacingOccurrences(of: "%20", with: "+") ?? terms.replacingOccurrences(of: " ", with: "+")
 
+            let searchURL = "https://www.bing.com/search?q=\(query)&setlang=en-US&cc=US&mkt=en-US"
             do {
                 let parsed = try parseURL(searchURL)
                 if parsed.scheme == "https" {
                     if let (status, contentType, rawHTML) = performHTTPSGetRawHTML(host: parsed.host, port: parsed.port, path: parsed.path) {
                         if status >= 200 && status < 300 {
-                            let results = parseDuckDuckGoHTML(rawHTML)
+                            let results = parseBingHTML(rawHTML)
                             if results.isEmpty {
+                                saveLastSearch(urls: [])
+                                // Save first 10000 characters of rawHTML for debugging
+                                let debugSnippet = String(rawHTML.prefix(10_000))
+                                let debugURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("bing_debug.html")
+                                try? debugSnippet.write(to: debugURL, atomically: true, encoding: .utf8)
                                 print("No results parsed.")
+                                print("Debug HTML saved to bing_debug.html")
                             } else {
                                 for (idx, r) in results.enumerated() {
                                     print("\(idx + 1). \(r.title)")
@@ -1138,10 +1383,13 @@ func run() -> Int32 {
                                     if let s = r.snippet, !s.isEmpty { print(s) }
                                     print("")
                                 }
+                                let urlsToSave = results.map { $0.link }
+                                saveLastSearch(urls: Array(urlsToSave.prefix(10)))
+                                print("[Bing] Saved \(min(10, urlsToSave.count)) URLs to .go2web-last-search")
                             }
                             return 0
                         } else {
-                            print("Search request failed with status: \(status). Content-Type: \(contentType ?? "-")")
+                            print("[Bing] Search request failed with status: \(status). Content-Type: \(contentType ?? "-")")
                             return 1
                         }
                     } else {
@@ -1149,7 +1397,7 @@ func run() -> Int32 {
                         return 1
                     }
                 } else {
-                    print("DuckDuckGo HTML search requires HTTPS.")
+                    print("Bing HTML search requires HTTPS.")
                     return 1
                 }
             } catch {
@@ -1160,7 +1408,7 @@ func run() -> Int32 {
             return printError("Unknown option or argument: \(arg).\n\nRun 'go2web -h' for usage.")
         }
 
-        index += 1
+    
     }
 
     return 0
@@ -1173,3 +1421,4 @@ struct Go2Web {
         exit(code)
     }
 }
+

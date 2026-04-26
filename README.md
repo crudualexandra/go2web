@@ -205,3 +205,10 @@ The program now:
     •    prints the top 10 search results;
     •    does not use URLSession, URLRequest, Data(contentsOf:), or HTTP client libraries.
 This satisfies the main laboratory requirement for go2web -s <search-term>.
+### Step 10 — Open search results by number
+
+In this step, the search results became accessible through the CLI.
+
+After running a search, the program saves the top result URLs into `.go2web-last-search`.
+
+The search command uses Bing HTML results because DuckDuckGo returned an anti-bot challenge page during testing. The program still performs a manual HTTPS request and parses the returned HTML without using an HTTP client library.
