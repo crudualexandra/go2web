@@ -137,3 +137,18 @@ This domain is for use in documentation examples without needing permission. Avo
 Learn more
 ```
 This step satisfies the requirement that responses should be human-readable and not printed as raw HTML.
+
+
+### Step 5 — HTTP redirect handling
+
+In this step, HTTP redirect support was added.
+
+The program now detects redirect status codes:
+
+- `301`
+- `302`
+- `303`
+- `307`
+- `308`
+
+When a redirect response is received, the program reads the `Location` header and follows the new address. Both absolute and relative redirect locations are supported. A maximum limit of 5 redirects is used to avoid infinite redirect loops.
