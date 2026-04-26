@@ -131,6 +131,131 @@ func parseURL(_ input: String) throws -> ParsedURL {
     return ParsedURL(scheme: scheme, host: host, port: finalPort, path: path)
 }
 
+private func decodeCommonHTMLEntities(_ text: String) -> String {
+    var result = text
+    let entities: [(String, String)] = [
+        ("&amp;", "&"),
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&quot;", "\""),
+        ("&#39;", "'"),
+        ("&nbsp;", " ")
+    ]
+    for (entity, char) in entities {
+        result = result.replacingOccurrences(of: entity, with: char)
+    }
+    return result
+}
+
+func makeHumanReadable(body: String, contentType: String?) -> String {
+    let type = contentType?.lowercased() ?? ""
+    // JSON pretty print
+    if type.contains("application/json") {
+        if let data = body.data(using: .utf8) {
+            if let obj = try? JSONSerialization.jsonObject(with: data),
+               JSONSerialization.isValidJSONObject(obj),
+               let prettyData = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]),
+               let pretty = String(data: prettyData, encoding: .utf8) {
+                return pretty
+            }
+        }
+        return body
+    }
+
+    // HTML to text
+    if type.contains("text/html") {
+        var text = body
+        // Normalize newlines
+        text = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+
+        // Remove <script> and <style> blocks (non-greedy, across lines)
+        if let reScript = try? NSRegularExpression(pattern: "<script\\b[\\s\\S]*?<\\/script>", options: [.caseInsensitive]) {
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            text = reScript.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: " ")
+        }
+        if let reStyle = try? NSRegularExpression(pattern: "<style\\b[\\s\\S]*?<\\/style>", options: [.caseInsensitive]) {
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            text = reStyle.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: " ")
+        }
+
+        // Replace common line-break tags with newlines before stripping remaining tags
+        text = text.replacingOccurrences(of: "<br>", with: "\n", options: .caseInsensitive)
+        text = text.replacingOccurrences(of: "<br/>", with: "\n", options: .caseInsensitive)
+        text = text.replacingOccurrences(of: "<br />", with: "\n", options: .caseInsensitive)
+        text = text.replacingOccurrences(of: "</p>", with: "\n\n", options: .caseInsensitive)
+
+        // Remove all remaining HTML tags
+        if let reTags = try? NSRegularExpression(pattern: "<[^>]+>", options: [.caseInsensitive]) {
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            text = reTags.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: " ")
+        }
+
+        // Decode a few common HTML entities
+        text = decodeCommonHTMLEntities(text)
+
+        // Collapse multiple blank lines
+        if let reBlank = try? NSRegularExpression(pattern: "\n\\s*\n+", options: []) {
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            text = reBlank.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: "\n\n")
+        }
+
+        // Trim whitespace
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // Default: plain text
+    return body
+}
+
+func decodeChunkedBody(_ body: String) -> String {
+    // Work at the byte level to honor chunk sizes (hex is in bytes)
+    let bytes = Array(body.utf8)
+    let n = bytes.count
+    var i = 0
+    var out: [UInt8] = []
+
+    func readLine() -> String? {
+        if i >= n { return nil }
+        let start = i
+        while i < n && bytes[i] != 0x0A { // '\n'
+            i += 1
+        }
+        var end = i
+        if i < n && bytes[i] == 0x0A { // consume '\n'
+            i += 1
+            if end > start && bytes[end - 1] == 0x0D { // '\r'
+                end -= 1
+            }
+        }
+        let lineBytes = bytes[start..<end]
+        return String(decoding: lineBytes, as: UTF8.self)
+    }
+
+    while true {
+        guard let sizeLine = readLine() else { break }
+        let noExt = sizeLine.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? sizeLine
+        let trimmed = noExt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let size = Int(trimmed, radix: 16) else { break }
+        if size == 0 {
+            // End of chunks. Ignore optional trailers.
+            break
+        }
+        if i + size > n { break }
+        out.append(contentsOf: bytes[i..<(i + size)])
+        i += size
+        // Consume trailing CRLF (or LF) after the chunk data if present
+        if i + 1 <= n {
+            if i + 1 < n && bytes[i] == 0x0D && bytes[i + 1] == 0x0A {
+                i += 2
+            } else if i < n && bytes[i] == 0x0A {
+                i += 1
+            }
+        }
+    }
+
+    return String(decoding: out, as: UTF8.self)
+}
+
 private func isIPv6LiteralHost(_ host: String) -> Bool {
     return host.contains(":")
 }
@@ -226,20 +351,48 @@ func performPlainHTTPGet(host: String, port: Int, path: String) -> Int32 {
         let head = String(response[..<sep.lowerBound])
         let body = String(response[sep.upperBound...])
         let lines = head.split(whereSeparator: { $0.isNewline }).map(String.init)
-        let statusLine = lines.first ?? ""
-        let headers = lines.dropFirst().joined(separator: "\n")
-        print(statusLine)
-        print(headers)
-        print(body)
+        var contentTypeHeader: String? = nil
+        var transferEncodingHeader: String? = nil
+        for headerLine in lines.dropFirst() { // skip status line
+            if let colon = headerLine.firstIndex(of: ":") {
+                let name = headerLine[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+                let value = headerLine[headerLine.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+                if name == "content-type" {
+                    contentTypeHeader = String(value)
+                } else if name == "transfer-encoding" {
+                    transferEncodingHeader = String(value)
+                }
+            }
+        }
+        var processedBody = body
+        if let te = transferEncodingHeader?.lowercased(), te.contains("chunked") {
+            processedBody = decodeChunkedBody(body)
+        }
+        let readable = makeHumanReadable(body: processedBody, contentType: contentTypeHeader)
+        print(readable)
     } else if let sep = response.range(of: "\n\n") {
         let head = String(response[..<sep.lowerBound])
         let body = String(response[sep.upperBound...])
         let lines = head.split(whereSeparator: { $0.isNewline }).map(String.init)
-        let statusLine = lines.first ?? ""
-        let headers = lines.dropFirst().joined(separator: "\n")
-        print(statusLine)
-        print(headers)
-        print(body)
+        var contentTypeHeader: String? = nil
+        var transferEncodingHeader: String? = nil
+        for headerLine in lines.dropFirst() { // skip status line
+            if let colon = headerLine.firstIndex(of: ":") {
+                let name = headerLine[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+                let value = headerLine[headerLine.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+                if name == "content-type" {
+                    contentTypeHeader = String(value)
+                } else if name == "transfer-encoding" {
+                    transferEncodingHeader = String(value)
+                }
+            }
+        }
+        var processedBody = body
+        if let te = transferEncodingHeader?.lowercased(), te.contains("chunked") {
+            processedBody = decodeChunkedBody(body)
+        }
+        let readable = makeHumanReadable(body: processedBody, contentType: contentTypeHeader)
+        print(readable)
     } else {
         print(response)
     }

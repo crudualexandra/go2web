@@ -108,3 +108,32 @@ Transfer-Encoding: chunked
 <!doctype html><html lang="en"><head><title>Example Domain</title>...
 ```
 At this stage, the response is still printed mostly raw. HTML cleaning and human-readable formatting will be implemented in the next step.
+
+
+### Step 4 — Human-readable response formatting
+
+In this step, raw HTTP responses were converted into human-readable output.
+
+The program now:
+
+- reads the `Content-Type` header;
+- removes HTML tags from `text/html` responses;
+- removes `script` and `style` blocks;
+- decodes common HTML entities;
+- pretty-prints JSON responses when the content type is `application/json`;
+- handles `Transfer-Encoding: chunked` responses by removing chunk size markers before formatting the body.
+
+Tested command:
+
+```bash
+swift run go2web -u http://example.com
+```
+Result:
+```bash
+Example Domain
+
+This domain is for use in documentation examples without needing permission. Avoid use in operations.
+
+Learn more
+```
+This step satisfies the requirement that responses should be human-readable and not printed as raw HTML.
