@@ -40,3 +40,39 @@ Usage:
   go2web -s <search-term>
 ```
 
+### Step 2 — Manual URL parsing
+
+In this step, manual URL parsing was added for `http://` and `https://` addresses.
+
+The parser extracts:
+
+- scheme
+- host
+- port
+- path
+
+Default ports are selected automatically:
+
+- `http` → port `80`
+- `https` → port `443`
+
+Tested commands:
+
+```bash
+swift run go2web -u http://example.com
+swift run go2web -u http://example.com/test/page
+swift run go2web -u "https://example.com/search?q=test"
+```
+
+Example result:
+```bash
+[go2web] Parsed URL:
+  scheme: https
+  host:   example.com
+  port:   443
+  path:   /search?q=test
+```
+At this stage, the program still does not make a real network request. The parsed URL will be used in the next step to build a raw HTTP request over TCP sockets.
+
+
+
