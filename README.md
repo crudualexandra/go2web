@@ -152,3 +152,19 @@ The program now detects redirect status codes:
 - `308`
 
 When a redirect response is received, the program reads the `Location` header and follows the new address. Both absolute and relative redirect locations are supported. A maximum limit of 5 redirects is used to avoid infinite redirect loops.
+
+
+### Step 6 — File-based HTTP cache
+
+In this step, a simple file-based cache mechanism was added.
+
+The program now creates a local folder named `.go2web-cache` in the current working directory. Successful GET responses are saved in this folder.
+
+Each cache file stores:
+
+- timestamp
+- status code
+- content type
+- human-readable body
+
+The cache TTL is 300 seconds. If the same URL is requested again within this time, the program reads the saved response from cache instead of making a new network request.
