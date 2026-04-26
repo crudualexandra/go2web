@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 
 @discardableResult
@@ -13,7 +18,7 @@ func printHelp(to handle: FileHandle = .standardOutput) -> Int32 {
 
     Options:
       -h                Show this help message and exit.
-      -u <URL>          Open or fetch the given URL (placeholder, no network yet).
+      -u <URL>          Fetch the given URL over HTTP (HTTPS support will be added later).
       -s <term>         Search using the provided term (placeholder). Multiple words are allowed.
 
     
@@ -126,6 +131,122 @@ func parseURL(_ input: String) throws -> ParsedURL {
     return ParsedURL(scheme: scheme, host: host, port: finalPort, path: path)
 }
 
+private func isIPv6LiteralHost(_ host: String) -> Bool {
+    return host.contains(":")
+}
+
+func performPlainHTTPGet(host: String, port: Int, path: String) -> Int32 {
+    var hints = addrinfo(ai_flags: 0, ai_family: AF_UNSPEC, ai_socktype: SOCK_STREAM, ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
+    var res: UnsafeMutablePointer<addrinfo>? = nil
+    let portStr = String(port)
+    let gaiStatus = host.withCString { hPtr in
+        portStr.withCString { sPtr in
+            getaddrinfo(hPtr, sPtr, &hints, &res)
+        }
+    }
+    if gaiStatus != 0 {
+        let msg = String(cString: gai_strerror(gaiStatus))
+        _ = printError("getaddrinfo failed: \(msg)")
+        return 1
+    }
+
+    var fd: Int32 = -1
+    var ptr = res
+    while ptr != nil {
+        let ai = ptr!.pointee
+        fd = socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol)
+        if fd == -1 {
+            ptr = ai.ai_next
+            continue
+        }
+        if connect(fd, ai.ai_addr, ai.ai_addrlen) == 0 {
+            break
+        } else {
+            close(fd)
+            fd = -1
+            ptr = ai.ai_next
+        }
+    }
+
+    if res != nil {
+        freeaddrinfo(res)
+    }
+
+    if fd == -1 {
+        _ = printError("Could not connect to \(host):\(port)")
+        return 1
+    }
+
+    defer { close(fd) }
+
+    let hostHeaderHost = isIPv6LiteralHost(host) ? "[\(host)]" : host
+    let defaultPort = 80
+    let hostHeader = (port == defaultPort) ? hostHeaderHost : "\(hostHeaderHost):\(port)"
+    let request = "GET \(path.isEmpty ? "/" : path) HTTP/1.1\r\nHost: \(hostHeader)\r\nUser-Agent: go2web-swift/1.0\r\nAccept: text/html, application/json\r\nConnection: close\r\n\r\n"
+
+    let reqBytes = Array(request.utf8)
+    var totalSent = 0
+    while totalSent < reqBytes.count {
+        let sent = reqBytes.withUnsafeBytes { buf -> Int in
+            let base = buf.baseAddress!.advanced(by: totalSent)
+            return send(fd, base, reqBytes.count - totalSent, 0)
+        }
+        if sent <= 0 {
+            _ = printError("send failed.")
+            return 1
+        }
+        totalSent += sent
+    }
+
+    var responseBytes: [UInt8] = []
+    let bufferSize = 4096
+    var buffer = [UInt8](repeating: 0, count: bufferSize)
+
+    while true {
+        let received = buffer.withUnsafeMutableBytes { ptr -> Int in
+            guard let base = ptr.baseAddress else {
+                return -1
+            }
+            return recv(fd, base, bufferSize, 0)
+        }
+
+        if received > 0 {
+            responseBytes.append(contentsOf: buffer.prefix(received))
+        } else if received == 0 {
+            break
+        } else {
+            _ = printError("recv failed.")
+            return 1
+        }
+    }
+
+    let response = String(decoding: responseBytes, as: UTF8.self)
+
+    if let sep = response.range(of: "\r\n\r\n") {
+        let head = String(response[..<sep.lowerBound])
+        let body = String(response[sep.upperBound...])
+        let lines = head.split(whereSeparator: { $0.isNewline }).map(String.init)
+        let statusLine = lines.first ?? ""
+        let headers = lines.dropFirst().joined(separator: "\n")
+        print(statusLine)
+        print(headers)
+        print(body)
+    } else if let sep = response.range(of: "\n\n") {
+        let head = String(response[..<sep.lowerBound])
+        let body = String(response[sep.upperBound...])
+        let lines = head.split(whereSeparator: { $0.isNewline }).map(String.init)
+        let statusLine = lines.first ?? ""
+        let headers = lines.dropFirst().joined(separator: "\n")
+        print(statusLine)
+        print(headers)
+        print(body)
+    } else {
+        print(response)
+    }
+
+    return 0
+}
+
 func run() -> Int32 {
     let args = CommandLine.arguments
     // args[0] is the executable name.
@@ -151,12 +272,11 @@ func run() -> Int32 {
             let urlString = args[nextIndex]
             do {
                 let parsed = try parseURL(urlString)
-                print("[go2web] Parsed URL:")
-                print("  scheme: \(parsed.scheme)")
-                print("  host:   \(parsed.host)")
-                print("  port:   \(parsed.port)")
-                print("  path:   \(parsed.path)")
-                return 0
+                if parsed.scheme == "https" {
+                    print("HTTPS support will be added later.")
+                    return 0
+                }
+                return performPlainHTTPGet(host: parsed.host, port: parsed.port, path: parsed.path)
             } catch {
                 if let e = error as? URLParseError {
                     return printError(e.localizedDescription)

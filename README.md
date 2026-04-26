@@ -76,3 +76,35 @@ At this stage, the program still does not make a real network request. The parse
 
 
 
+### Step 3 — Raw HTTP GET over POSIX sockets
+
+In this step, the `-u` command was connected to a real HTTP request implementation.
+
+The program now:
+
+- parses the URL;
+- creates a TCP socket using POSIX socket functions;
+- resolves the host with `getaddrinfo`;
+- connects to the server using `connect`;
+- manually builds an HTTP/1.1 `GET` request as text;
+- sends the request using `send`;
+- reads the raw server response using `recv`;
+- separates the HTTP headers from the response body.
+
+No HTTP client libraries are used. The implementation does not use `URLSession`, `URLRequest`, `Data(contentsOf:)`, Alamofire, or any third-party HTTP client.
+
+Tested command:
+
+```bash
+swift run go2web -u http://example.com
+```
+
+Result:
+```bash
+HTTP/1.1 200 OK
+Content-Type: text/html
+Transfer-Encoding: chunked
+
+<!doctype html><html lang="en"><head><title>Example Domain</title>...
+```
+At this stage, the response is still printed mostly raw. HTML cleaning and human-readable formatting will be implemented in the next step.
