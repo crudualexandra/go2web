@@ -48,6 +48,16 @@ struct HTTPFetchResult {
     let readableBody: String
 }
 
+struct SearchResult {
+    let title: String
+    let link: String
+    let snippet: String?
+}
+
+private func percentDecode(_ s: String) -> String {
+    return s.removingPercentEncoding ?? s
+}
+
 enum URLParseError: LocalizedError {
     case empty
     case missingScheme
@@ -169,6 +179,76 @@ private func decodeCommonHTMLEntities(_ text: String) -> String {
     }
 
     return result
+}
+
+func parseDuckDuckGoHTML(_ html: String) -> [SearchResult] {
+    // Normalize newlines and collapse some whitespace for simpler regex scanning
+    let text = html.replacingOccurrences(of: "\r\n", with: "\n")
+                   .replacingOccurrences(of: "\r", with: "\n")
+
+    // Regex to find result titles and links
+    // Captures href (group 1) and inner HTML of the anchor (group 2)
+    let pattern = "<a[^>]*class=\\\"result__a\\\"[^>]*href=\\\"([^\\\"]+)\\\"[^>]*>([\\s\\S]*?)</a>"
+    guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+
+    var results: [SearchResult] = []
+    let nsrange = NSRange(text.startIndex..<text.endIndex, in: text)
+
+    re.enumerateMatches(in: text, options: [], range: nsrange) { match, _, stop in
+        guard let match = match, match.numberOfRanges >= 3 else { return }
+
+        // Extract href
+        let hrefRange = match.range(at: 1)
+        let titleHTMLRange = match.range(at: 2)
+        guard let hrefSwiftRange = Range(hrefRange, in: text),
+              let titleHTMLSwiftRange = Range(titleHTMLRange, in: text) else { return }
+
+        let href = String(text[hrefSwiftRange])
+        var titleHTML = String(text[titleHTMLSwiftRange])
+
+        // Convert basic entities and strip inner tags to get title text
+        titleHTML = decodeCommonHTMLEntities(titleHTML)
+        if let titleTags = try? NSRegularExpression(pattern: "<[^>]+>", options: []) {
+            let r = NSRange(titleHTML.startIndex..<titleHTML.endIndex, in: titleHTML)
+            titleHTML = titleTags.stringByReplacingMatches(in: titleHTML, options: [], range: r, withTemplate: " ")
+        }
+        let title = titleHTML.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // DuckDuckGo uses redirect links like /l/?kh=-1&uddg=<encoded>
+        // Try to resolve uddg parameter if present
+        var link = href.replacingOccurrences(of: "&amp;", with: "&")
+        if link.hasPrefix("/l/?") || link.hasPrefix("/l? ") || link.contains("uddg=") {
+            if let qIndex = link.range(of: "uddg=")?.upperBound {
+                let encoded = String(link[qIndex...])
+                // Trim after next & if present
+                let decodedParam = encoded.split(separator: "&", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? encoded
+                link = percentDecode(decodedParam)
+            }
+        }
+
+        // Find a nearby snippet after this anchor
+        var snippet: String? = nil
+        let searchStart = titleHTMLSwiftRange.upperBound
+        let tail = String(text[searchStart...])
+        if let snippetRe = try? NSRegularExpression(pattern: "<div[^>]*class=\\\"result__snippet[^\\\"]*\\\"[^>]*>([\\s\\S]*?)</div>", options: [.caseInsensitive]) {
+            let nsTail = NSRange(tail.startIndex..<tail.endIndex, in: tail)
+            if let m = snippetRe.firstMatch(in: tail, options: [], range: nsTail), m.numberOfRanges >= 2,
+               let sr = Range(m.range(at: 1), in: tail) {
+                var inner = String(tail[sr])
+                inner = decodeCommonHTMLEntities(inner)
+                if let tagRe = try? NSRegularExpression(pattern: "<[^>]+>", options: []) {
+                    let r = NSRange(inner.startIndex..<inner.endIndex, in: inner)
+                    inner = tagRe.stringByReplacingMatches(in: inner, options: [], range: r, withTemplate: " ")
+                }
+                snippet = inner.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        results.append(SearchResult(title: title, link: link, snippet: snippet))
+        if results.count >= 10 { stop.pointee = true }
+    }
+
+    return results
 }
 
 func makeHumanReadable(body: String, contentType: String?) -> String {
@@ -427,7 +507,7 @@ private func readCache(for url: String, ttl: TimeInterval = 300) -> HTTPFetchRes
 
     let age = Date().timeIntervalSince1970 - savedAt
 
-    guard age >= 0 && age <= ttl else {
+    guard age >= 0 && age <= 300 else {
         return nil
     }
 
@@ -739,13 +819,20 @@ func run() -> Int32 {
 
         case "-s":
             let nextIndex = index + 1
-
             guard nextIndex < args.count else {
                 return printError("Missing search term after -s.\n\nTry: go2web -s swift concurrency tutorial")
             }
-
             let terms = args[nextIndex...].joined(separator: " ")
-            print("[go2web] Would search for: \(terms)")
+            // Encode spaces as + per requirement
+            let query = terms.replacingOccurrences(of: " ", with: "+")
+            let searchURL = "https://html.duckduckgo.com/html/?q=\(query)"
+
+            print("[SEARCH] DuckDuckGo HTML: \(searchURL)")
+            print("HTTPS is required for this endpoint. Add HTTPS client support to fetch and parse results. The parser is ready.")
+            // Once HTTPS is implemented, you can:
+            // 1) fetch the body from searchURL
+            // 2) let results = parseDuckDuckGoHTML(body)
+            // 3) pretty-print results
             return 0
 
         default:

@@ -168,3 +168,19 @@ Each cache file stores:
 - human-readable body
 
 The cache TTL is 300 seconds. If the same URL is requested again within this time, the program reads the saved response from cache instead of making a new network request.
+
+
+### Step 7 — Search command preparation
+
+In this step, the `-s` command was prepared for web search.
+
+The program now:
+
+- accepts one or multiple words after `-s`;
+- builds a DuckDuckGo HTML search URL;
+- encodes spaces as `+`;
+- includes a parser prepared for extracting the top 10 results from DuckDuckGo HTML;
+- extracts result title, link, and snippet when HTML content is available;
+- does not use external HTML parser libraries;
+- does not use `URLSession`, `URLRequest`, `Data(contentsOf:)`, or HTTP client libraries.
+At this stage, real search fetching is not active yet because the selected DuckDuckGo HTML endpoint requires HTTPS. The search parser is already implemented and will be used after HTTPS transport support is added.
