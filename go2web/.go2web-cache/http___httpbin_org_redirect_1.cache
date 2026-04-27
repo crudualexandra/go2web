@@ -1,4 +1,4 @@
-timestamp: 1777204121.5081549
+timestamp: 1777281749.934454
 status-code: 200
 content-type: application/json
 ---GO2WEB_BODY---
@@ -9,9 +9,9 @@ content-type: application/json
   "headers" : {
     "User-Agent" : "go2web-swift\/1.0",
     "Host" : "httpbin.org",
-    "X-Amzn-Trace-Id" : "Root=1-69edfb99-445ea4b77ef16d8a076f5d45",
+    "X-Amzn-Trace-Id" : "Root=1-69ef2ad5-04bb089a3032af5a7d67126e",
     "Accept" : "text\/html, application\/json"
   },
-  "origin" : "95.65.73.3",
-  "url" : "https:\/\/httpbin.org\/get"
+  "origin" : "81.180.73.66",
+  "url" : "http:\/\/httpbin.org\/get"
 }

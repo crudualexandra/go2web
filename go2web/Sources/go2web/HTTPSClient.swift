@@ -104,11 +104,16 @@ private func receiveAllOverNWConnection(host: String, port: UInt16, request: Str
     return box.resultString()
 }
 
-
 func performHTTPSGet(host: String, port: Int, path: String) -> HTTPFetchResult? {
     var current = ParsedURL(scheme: "https", host: host, port: port, path: path)
     let maxRedirects = 5
     var redirects = 0
+
+    enum HTTPSResponseDecision {
+        case final(HTTPFetchResult)
+        case followRedirect
+        case fatalError
+    }
 
     while true {
         let hostHeaderHost = isIPv6LiteralHost(current.host) ? "[\(current.host)]" : current.host
@@ -118,7 +123,7 @@ func performHTTPSGet(host: String, port: Int, path: String) -> HTTPFetchResult? 
             return nil
         }
 
-        func handleHeadAndBody(head: String, body: String) -> HTTPFetchResult? {
+        func handleHeadAndBody(head: String, body: String) -> HTTPSResponseDecision {
             let lines = head.split(whereSeparator: { $0.isNewline }).map(String.init)
             let statusLine = lines.first ?? ""
             var statusCode = 0
@@ -143,29 +148,33 @@ func performHTTPSGet(host: String, port: Int, path: String) -> HTTPFetchResult? 
             }
 
             if [301, 302, 303, 307, 308].contains(statusCode), let loc = locationHeader {
+                redirects += 1
+                if redirects > maxRedirects {
+                    _ = printError("Too many redirects (max 5).")
+                    return .fatalError
+                }
+
                 let lower = loc.lowercased()
                 if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
                     if let parsed = try? parseURL(loc) {
                         if parsed.scheme == "https" {
                             current = parsed
                         } else {
-                            // Switch to plain HTTP client for http redirects
-                            return performPlainHTTPGet(host: parsed.host, port: parsed.port, path: parsed.path)
+                            if let res = performPlainHTTPGet(host: parsed.host, port: parsed.port, path: parsed.path) {
+                                return .final(res)
+                            } else {
+                                return .fatalError
+                            }
                         }
                     } else {
                         _ = printError("Invalid redirect Location: \(loc)")
-                        return nil
+                        return .fatalError
                     }
                 } else {
                     let newPath = resolveRelativePath(basePath: current.path, relative: loc)
                     current = ParsedURL(scheme: current.scheme, host: current.host, port: current.port, path: newPath)
                 }
-                redirects += 1
-                if redirects > maxRedirects {
-                    _ = printError("Too many redirects (max 5).")
-                    return nil
-                }
-                return nil
+                return .followRedirect
             }
 
             var processedBody = body
@@ -173,17 +182,31 @@ func performHTTPSGet(host: String, port: Int, path: String) -> HTTPFetchResult? 
                 processedBody = decodeChunkedBody(body)
             }
             let readable = makeHumanReadable(body: processedBody, contentType: contentTypeHeader)
-            return HTTPFetchResult(statusCode: statusCode, contentType: contentTypeHeader, readableBody: readable)
+            return .final(HTTPFetchResult(statusCode: statusCode, contentType: contentTypeHeader, readableBody: readable))
         }
 
         if let sep = response.range(of: "\r\n\r\n") {
             let head = String(response[..<sep.lowerBound])
             let body = String(response[sep.upperBound...])
-            if let r = handleHeadAndBody(head: head, body: body) { return r } else { continue }
+            switch handleHeadAndBody(head: head, body: body) {
+            case .final(let result):
+                return result
+            case .followRedirect:
+                continue
+            case .fatalError:
+                return nil
+            }
         } else if let sep = response.range(of: "\n\n") {
             let head = String(response[..<sep.lowerBound])
             let body = String(response[sep.upperBound...])
-            if let r = handleHeadAndBody(head: head, body: body) { return r } else { continue }
+            switch handleHeadAndBody(head: head, body: body) {
+            case .final(let result):
+                return result
+            case .followRedirect:
+                continue
+            case .fatalError:
+                return nil
+            }
         } else {
             return HTTPFetchResult(statusCode: 0, contentType: nil, readableBody: response)
         }
@@ -196,6 +219,12 @@ func performHTTPSGetRawHTML(host: String, port: Int, path: String) -> (Int, Stri
     let maxRedirects = 5
     var redirects = 0
 
+    enum HTTPSRawResponseDecision {
+        case final(HTTPFetchResult)
+        case followRedirect
+        case fatalError
+    }
+
     while true {
         let hostHeaderHost = isIPv6LiteralHost(current.host) ? "[\(current.host)]" : current.host
         let request = buildHTTPRequest(hostHeader: hostHeaderHost, path: current.path, defaultPort: 443, port: current.port)
@@ -203,7 +232,7 @@ func performHTTPSGetRawHTML(host: String, port: Int, path: String) -> (Int, Stri
             return nil
         }
 
-        func handleHeadAndBody(head: String, body: String) -> (Int, String?, String)? {
+        func handleHeadAndBody(head: String, body: String) -> HTTPSRawResponseDecision {
             let lines = head.split(whereSeparator: { $0.isNewline }).map(String.init)
             let statusLine = lines.first ?? ""
             var statusCode = 0
@@ -228,45 +257,61 @@ func performHTTPSGetRawHTML(host: String, port: Int, path: String) -> (Int, Stri
             }
 
             if [301, 302, 303, 307, 308].contains(statusCode), let loc = locationHeader {
+                redirects += 1
+                if redirects > maxRedirects { return .fatalError }
+
                 let lower = loc.lowercased()
                 if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
                     if let parsed = try? parseURL(loc) {
                         if parsed.scheme == "https" {
                             // Switch to plain HTTP client for http redirects (raw body not supported here)
                             if let result = performPlainHTTPGet(host: parsed.host, port: parsed.port, path: parsed.path) {
-                                return (result.statusCode, result.contentType, result.readableBody)
+                                return .final(result)
                             }
-                            return nil
+                            return .fatalError
                         } else {
                             current = parsed
                         }
                     } else {
-                        return nil
+                        return .fatalError
                     }
                 } else {
                     let newPath = resolveRelativePath(basePath: current.path, relative: loc)
                     current = ParsedURL(scheme: current.scheme, host: current.host, port: current.port, path: newPath)
                 }
-                redirects += 1
-                if redirects > maxRedirects { return nil }
-                return nil
+                return .followRedirect
             }
 
             var processedBody = body
             if let te = transferEncodingHeader?.lowercased(), te.contains("chunked") {
                 processedBody = decodeChunkedBody(body)
             }
-            return (statusCode, contentTypeHeader, processedBody)
+            let result = HTTPFetchResult(statusCode: statusCode, contentType: contentTypeHeader, readableBody: processedBody)
+            return .final(result)
         }
 
         if let sep = response.range(of: "\r\n\r\n") {
             let head = String(response[..<sep.lowerBound])
             let body = String(response[sep.upperBound...])
-            if let r = handleHeadAndBody(head: head, body: body) { return r } else { continue }
+            switch handleHeadAndBody(head: head, body: body) {
+            case .final(let r):
+                return (r.statusCode, r.contentType, r.readableBody)
+            case .followRedirect:
+                continue
+            case .fatalError:
+                return nil
+            }
         } else if let sep = response.range(of: "\n\n") {
             let head = String(response[..<sep.lowerBound])
             let body = String(response[sep.upperBound...])
-            if let r = handleHeadAndBody(head: head, body: body) { return r } else { continue }
+            switch handleHeadAndBody(head: head, body: body) {
+            case .final(let r):
+                return (r.statusCode, r.contentType, r.readableBody)
+            case .followRedirect:
+                continue
+            case .fatalError:
+                return nil
+            }
         } else {
             return (0, nil, response)
         }
@@ -296,3 +341,4 @@ func performHTTPSGetRawHTML(host: String, port: Int, path: String) -> (Int, Stri
     return nil
 }
 #endif
+

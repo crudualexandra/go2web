@@ -1,5 +1,10 @@
 # go2web
 
+redirect fix: Redirects were fixed in performPlainHTTPGet, performHTTPSGet, and performHTTPSGetRawHTML by using ResponseDecision with final, followRedirect, and fatalError.
+
+Now redirects are counted before following the next Location header. If the limit of 5 is exceeded, the function returns fatalError and stops immediately without printing or caching the final response. resolveRelativePath handles relative redirects, and parseURL handles full redirect URLs.
+
+
 `go2web` is a Swift command-line tool created for the Web Programming laboratory work.  
 The goal of the project is to implement a small CLI web client that can make manual HTTP requests, search the web, and display human-readable responses without using built-in or third-party HTTP client libraries.
 
@@ -444,3 +449,17 @@ Feb 13, 2025 &#0183;&#32;Iphone keeps asking for password you must enter both yo
 [Bing] Saved 10 URLs to .go2web-last-search
 sanduta@Crudus-MacBook-Air go2web % 
 ```
+
+
+
+
+./go2web -h : Shows the help menu with all available CLI options.
+./go2web -u https://wikipedia.org : Makes an HTTPS request to example.com and prints the page in human-readable text format.
+./go2web -u https://wikipedia.org : Runs the same request again to demonstrate the cache mechanism. It should show [CACHE HIT] if the response was saved.
+./go2web -u http://httpbin.org/get : Makes an HTTP request to a JSON endpoint and prints the JSON response in a readable formatted way.
+./go2web -u http://httpbin.org/redirect/1 ; 
+./go2web -u https://httpbin.org/redirect/6
+: Tests redirect handling. The program follows the redirect and prints the final response.
+./go2web -s chocolate information : Searches the web for "chocolate information" and prints the top 10 results.
+./go2web -u 1 : Opens the first link f..../  rom the last search results saved by the program.
+

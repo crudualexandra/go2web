@@ -1,5 +1,11 @@
 import Foundation
 
+enum ResponseDecision {
+    case final(HTTPFetchResult)
+    case followRedirect
+    case fatalError
+}
+
 func resolveRelativePath(basePath: String, relative: String) -> String {
     if relative.hasPrefix("/") {
         return relative

@@ -127,7 +127,7 @@ func performPlainHTTPGet(host: String, port: Int, path: String) -> HTTPFetchResu
 
         let response = String(decoding: responseBytes, as: UTF8.self)
 
-        func handleHeadAndBody(head: String, body: String) -> HTTPFetchResult? {
+        func handleHeadAndBody(head: String, body: String) -> ResponseDecision {
             let lines = head.split(whereSeparator: { $0.isNewline }).map(String.init)
             let statusLine = lines.first ?? ""
 
@@ -161,33 +161,33 @@ func performPlainHTTPGet(host: String, port: Int, path: String) -> HTTPFetchResu
             }
 
             if [301, 302, 303, 307, 308].contains(statusCode), let loc = locationHeader {
+                // Increment and enforce limit before following
+                redirects += 1
+                if redirects > maxRedirects {
+                    _ = printError("Too many redirects (max 5).")
+                    return .fatalError
+                }
+
                 let lower = loc.lowercased()
 
                 if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
                     if let parsed = try? parseURL(loc) {
                         if parsed.scheme == "https" {
                             print("HTTPS support will be added later.")
-                            return HTTPFetchResult(statusCode: statusCode, contentType: contentTypeHeader, readableBody: "")
+                            return .final(HTTPFetchResult(statusCode: statusCode, contentType: contentTypeHeader, readableBody: ""))
                         } else {
                             current = parsed
                         }
                     } else {
                         _ = printError("Invalid redirect Location: \(loc)")
-                        return nil
+                        return .fatalError
                     }
                 } else {
                     let newPath = resolveRelativePath(basePath: current.path, relative: loc)
                     current = ParsedURL(scheme: current.scheme, host: current.host, port: current.port, path: newPath)
                 }
 
-                redirects += 1
-
-                if redirects > maxRedirects {
-                    _ = printError("Too many redirects (max 5).")
-                    return nil
-                }
-
-                return nil
+                return .followRedirect
             }
 
             var processedBody = body
@@ -198,31 +198,33 @@ func performPlainHTTPGet(host: String, port: Int, path: String) -> HTTPFetchResu
 
             let readable = makeHumanReadable(body: processedBody, contentType: contentTypeHeader)
 
-            return HTTPFetchResult(
+            return .final(HTTPFetchResult(
                 statusCode: statusCode,
                 contentType: contentTypeHeader,
                 readableBody: readable
-            )
+            ))
         }
 
-        let result: HTTPFetchResult?
-
+        let decision: ResponseDecision
         if let sep = response.range(of: "\r\n\r\n") {
             let head = String(response[..<sep.lowerBound])
             let body = String(response[sep.upperBound...])
-            result = handleHeadAndBody(head: head, body: body)
+            decision = handleHeadAndBody(head: head, body: body)
         } else if let sep = response.range(of: "\n\n") {
             let head = String(response[..<sep.lowerBound])
             let body = String(response[sep.upperBound...])
-            result = handleHeadAndBody(head: head, body: body)
+            decision = handleHeadAndBody(head: head, body: body)
         } else {
-            result = HTTPFetchResult(statusCode: 0, contentType: nil, readableBody: response)
+            decision = .final(HTTPFetchResult(statusCode: 0, contentType: nil, readableBody: response))
         }
 
-        if let finalResult = result {
-            return finalResult
+        switch decision {
+        case .final(let r):
+            return r
+        case .followRedirect:
+            continue
+        case .fatalError:
+            return nil
         }
-
-        continue
     }
 }
